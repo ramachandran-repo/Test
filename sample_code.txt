@@ -1,0 +1,410 @@
+import json
+import boto3
+import sys
+import os
+from datetime import datetime, timedelta
+import pandas as pd
+import xlsxwriter
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+from email.utils import formataddr
+from email.utils import make_msgid
+from email.utils import formatdate
+from botocore.exceptions import ClientError
+
+
+def upload_file_to_s3(bucket, temp_file_path):
+    print("uploading method")
+    s3 = boto3.resource('s3')
+    s3.Bucket(bucket).upload_file(temp_file_path, os.path.basename(temp_file_path))
+    print("file uploaded to s3")
+
+def verify_email_identity(aws_region, sender, recipientList):
+    mailingList = [sender] + recipientList
+    ses_client = boto3.client("ses", region_name=aws_region)
+    ses_response = ses_client.list_identities( IdentityType = 'EmailAddress', MaxItems=100)
+    for mailId in mailingList:
+        if not mailId in ses_response['Identities']:
+            response = ses_client.verify_email_identity(
+                EmailAddress=mailId
+                )
+    print("New user verification mail sent from SES")
+    
+def get_col_widths(dataframe):
+    # First we find the maximum length of the index column
+    idx_max = max([len(str(s)) for s in dataframe.index.values] + [len(str(dataframe.index.name))])
+    # Then, we concatenate this to the max of the lengths of column name and its values for each column, left to right
+    return [idx_max] + [max([len(str(s)) for s in dataframe[col].values] + [len(col)]) for col in dataframe.columns]
+
+def send_email(aws_region, sender, recipientList, eventJson):
+
+    job_region = eventJson["region"]
+    jobName = eventJson["detail"]["jobName"]
+    job_status = eventJson["detail"]["state"]
+    jobRunId = eventJson["detail"]["jobRunId"]
+    message = eventJson["detail"]["message"]
+    print(job_region)
+    print(jobName)
+    print(job_status)
+    print(jobRunId)
+    print(message)
+
+    # The subject line for the email.
+    SUBJECT = "Amazon SES Test - formatted mail"
+
+    # The email body for recipients with non-HTML email clients.
+    BODY_TEXT = ("The Job {jobName} which is running in {job_region} was {job_status} with the following message: {message}")
+                
+    # The HTML body of the email.
+    BODY_HTML = f"""<html>
+    <head></head>
+    <body>
+      <h1>The Job {jobName} which is running in {job_region} was {job_status}</h1>
+      <p>with the following message: {message}
+    </body>
+    </html>
+                """            
+
+    # The character encoding for the email.
+    CHARSET = "UTF-8"
+
+    # Create a new SES resource and specify a region.
+    client = boto3.client('ses',region_name=aws_region)
+
+    # Try to send the email.
+    try:
+        #Provide the contents of the email.
+        response = client.send_email(
+            Destination={
+                'ToAddresses': recipientList,
+            },
+            Message={
+                'Body': {
+                    'Html': {
+                        'Charset': CHARSET,
+                        'Data': BODY_HTML,
+                    },
+                    'Text': {
+                        'Charset': CHARSET,
+                        'Data': BODY_TEXT,
+                    },
+                },
+                'Subject': {
+                    'Charset': CHARSET,
+                    'Data': SUBJECT,
+                },
+            },
+            Source=sender,
+        )
+    except ClientError as e:
+        print(e.response['Error']['Message'])
+    else:
+        print("Email sent! Message ID:"),
+        print(response['MessageId'])
+
+def send_email_with_attachment(aws_region, sender, recipientList, attachment):
+
+    
+    # The subject line for the email.
+    SUBJECT = "Job status from AWS SES"
+
+    # The email body for recipients with non-HTML email clients.
+    BODY_TEXT = "Hi,\r\nPlease see the attached file for the job status."
+
+    # The HTML body of the email.
+    BODY_HTML = """\
+    <html>
+    <head></head>
+    <body>
+    <p>Hi,
+    </br>
+    </br>
+    Please see the attached file for the job status.
+    </br>
+    </br>
+    Thank you
+    </p>
+    </body>
+    </html>
+    """
+
+    # The character encoding for the email.
+    CHARSET = "utf-8"
+
+    # Create a new SES resource and specify a region.
+    client = boto3.client('ses',region_name=aws_region)
+
+    # Create a multipart/mixed parent container.
+    msg = MIMEMultipart('mixed')
+    # Add subject, from and to lines.
+    msg['Subject'] = SUBJECT 
+    msg['From'] = sender 
+    msg['To'] = ', '.join(recipientList)
+
+    # Create a multipart/alternative child container.
+    msg_body = MIMEMultipart('alternative')
+
+    # Encode the text and HTML content and set the character encoding. This step is
+    # necessary if you're sending a message with characters outside the ASCII range.
+    textpart = MIMEText(BODY_TEXT.encode(CHARSET), 'plain', CHARSET)
+    htmlpart = MIMEText(BODY_HTML.encode(CHARSET), 'html', CHARSET)
+
+    # Add the text and HTML parts to the child container.
+    msg_body.attach(textpart)
+    msg_body.attach(htmlpart)
+
+    # Define the attachment part and encode it using MIMEApplication.
+    att = MIMEApplication(open(attachment, 'rb').read())
+
+    # Add a header to tell the email client to treat this part as an attachment,
+    # and to give the attachment a name.
+    att.add_header('Content-Disposition','attachment',filename=os.path.basename(attachment))
+
+    # Attach the multipart/alternative child container to the multipart/mixed
+    # parent container.
+    msg.attach(msg_body)
+
+    # Add the attachment to the parent container.
+    msg.attach(att)
+    #print(msg)
+    try:
+        #Provide the contents of the email.
+        response = client.send_raw_email(
+            Source=sender,
+            Destinations=recipientList,
+            RawMessage={
+                'Data':msg.as_string(),
+            }
+        )
+    except ClientError as e:
+        print(e.response['Error']['Message'])
+    else:
+        print("Email sent! Message ID:"),
+        print(response['MessageId'])
+
+def getGlueJobStats(jobNamesList):
+    session = boto3.session.Session()
+    glue = session.client('glue')
+    allJobRunsIds = []
+    job_started_time_list = []
+    job_completed_time_list = []
+    job_status_list = []
+    job_name_list = []
+
+    try:
+        for jobName in jobNamesList:
+            print("Duration for Glue Job \"" + jobName + "\":")
+            allJobRuns = glue.get_job_runs(JobName=jobName)
+            
+            print("allJobRuns : ", allJobRuns)
+            
+            
+            yesterday = (datetime.now() - timedelta(1)).date()
+            today = datetime.now().date()
+            for jobRun in allJobRuns["JobRuns"]:
+                if jobRun['StartedOn'].date() == today:
+                    #add job run Id
+                    allJobRunsIds.append(jobRun['Id'])
+                    # add StartedOn
+                    job_started_time_list.append(jobRun['StartedOn'])
+                    # add CompletedOn
+                    job_completed_time_list.append(jobRun['CompletedOn'])
+                    # add job status
+                    job_status_list.append(jobRun['JobRunState'])
+                    # add job name
+                    job_name_list.append(jobRun['JobName'])
+                    
+        # create dataframe from the stats data
+        dct = {'Job Name': job_name_list, 
+              'Job Run ID': allJobRunsIds, 
+              'Job started time': job_started_time_list, 
+              'Job Completed time': job_completed_time_list, 
+              'Job Status': job_status_list
+            }
+        cdate = today
+        temp_file_path = f'/tmp/job_status_{cdate}.xlsx'
+        df = pd.DataFrame(dct, columns = ["Job Name", "Job Run ID", "Job started time", "Job Completed time", 'Job Status']) 
+        dt_cols = df.select_dtypes(include=['datetime64[ns, UTC]']).columns
+        for col in dt_cols:
+                df[col] = df[col].dt.tz_localize(None)
+        startCells = [1]
+        for row in range(2,len(df)+1):
+            if (df.loc[row-1,'Job Name'] != df.loc[row-2,'Job Name']):
+                startCells.append(row)
+        writer = pd.ExcelWriter(temp_file_path, engine='xlsxwriter')
+        lastRow = len(df)
+        df.to_excel(writer, sheet_name='Stats', index=False)
+        # set sheet name
+        workbook = writer.book
+        worksheet = writer.sheets['Stats']
+        merge_format = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'border': 2})
+        for row in startCells:
+            try:
+                endRow = startCells[startCells.index(row)+1]-1
+                if row == endRow:
+                    worksheet.write(row, 0, df.loc[row-1,'Job Name'], merge_format)
+                else:
+                    worksheet.merge_range(row, 0, endRow, 0, df.loc[row-1,'Job Name'], merge_format)
+            except IndexError:
+               if row == lastRow:
+                   worksheet.write(row, 0, df.loc[row-1,'Job Name'], merge_format)
+               else:
+                   worksheet.merge_range(row, 0, lastRow, 0, df.loc[row-1,'Job Name'], merge_format)
+
+        print("excel file created")
+
+
+        # border formatting
+        border_fmt = workbook.add_format({'bottom':5, 'top':5, 'left':5, 'right':5})
+        worksheet.conditional_format(xlsxwriter.utility.xl_range(0, 0, len(df), len(df.columns)-1), {'type': 'no_errors', 'format': border_fmt})
+
+        #worksheet.autofit()
+        # manual simulation of autofit
+        df_size_list = get_col_widths(df)
+        df_size_list.pop(0)
+        # drop index col from fitting
+        for i, width in enumerate(df_size_list):
+            worksheet.set_column(i, i, width)
+        writer.close()
+        return temp_file_path
+    except KeyError as e:
+        print("Key error occured", e)
+        print("expected field is not available in the glue stats event, please check the logs for the event json.")
+        
+def lambda_handler(event, context):
+    
+    #mailIdList = ['ramachandrans410@gmail.com', 'ramachandrans410@hotmail.com', "ramachandrans410.3@gmail.com"]
+    #sender = mailIdList.pop(0)
+    #recipientList = mailIdList
+    aws_region = 'us-east-1'
+    #jobNamesList = ["glue-rest-api", "glue-rest-api-copy"]
+
+
+    
+    with open("mdm_status_mailing_list.json") as midl:
+        mailList = json.load(midl)
+        sender = mailList["sender"]
+        recipientList = mailList["recipientList"]
+
+    print(event)
+
+    #eventJson = json.loads(event)
+
+    # verify the email identity in SES
+    verify_email_identity(aws_region, sender, recipientList)
+
+    if "type" not in event:
+        event["type"] = None
+
+    if event["type"] == "mdm_stats":
+        
+        # load the MDM job list
+        with open("mdm_jobs_list.json") as jl:
+            mdmJobsList =  json.load(jl)["jobNamesList"]
+
+        try:
+            # get job stats of the mentioned job list and create excel in tmp folder with details
+            temp_file_path = getGlueJobStats(mdmJobsList)
+
+            # upload the job details excel to s3
+            upload_file_to_s3('mycitybucketdata', temp_file_path)
+
+            # send mail with job details in Excel as attachment
+            send_email_with_attachment(aws_region, sender, recipientList, temp_file_path)
+
+            return {
+            'statusCode': 200,
+            'body': json.dumps('Successfully sent job status in mail!') }
+        except KeyError as e:
+            print("Key error occured", e)
+            return {
+            'statusCode': 400,
+            'body': json.dumps('Failed to send job status in mail!') }
+
+    else:
+        try:   
+            # send mail without attachment
+            send_email(aws_region, sender, recipientList, event)
+
+            return {
+            'statusCode': 200,
+            'body': json.dumps('Successfully sent job status in mail!') }
+
+        except KeyError as e:
+            print("Key error occured", e)
+            return {
+            'statusCode': 400,
+            'body': json.dumps('Failed to send job status in mail!') }
+
+
+
+
+=================================================
+
+
+
+
+
+
+import json
+import logging
+import time
+import boto3
+from botocore.exceptions import ClientError
+
+logger = logging.getLogger(__name__)
+
+def create_topic(name):
+    sns_client = boto3.client('sns', verify=False)
+    try:
+        topic = sns_client.create_topic(Name=name)
+        logger.info("Created topic %s with ARN %s.", name, topic['TopicArn'])
+    except ClientError:
+        logger.exception("Couldn't create topic %s.", name)
+        raise
+    else:
+        return topic
+
+def list_topics():
+    sns_client = boto3.client('sns')
+    try:
+        topics_iter = sns_client.list_topics()
+        logger.info("Got topics.")
+    except ClientError:
+        logger.exception("Couldn't get topics.")
+        raise
+    else:
+        return topics_iter
+
+def subscribe(topic, protocol, endpoint):
+    sns_client = boto3.client('sns', verify=False)
+    try:
+        subscription = sns_client.subscribe(
+            TopicArn=topic, Protocol=protocol, Endpoint=endpoint, ReturnSubscriptionArn=True)
+        logger.info("Subscribed %s %s to topic %s.", protocol, endpoint, topic)
+    except ClientError:
+        logger.exception(
+            "Couldn't subscribe %s %s to topic %s.", protocol, endpoint, topic)
+        raise
+    else:
+        return subscription
+
+def lambda_handler(event, context):
+    topic_name = 'mdm_glue_job_status'
+
+    print(f"Creating topic {topic_name}.")
+    topic = create_topic(topic_name)
+    topicArn = topic["TopicArn"]
+    print("topic: ", topic)
+    topics = list_topics()
+    for arn in topics['Topics']:
+        print(arn['TopicArn'])
+    # Create email subscription
+    response = subscribe(topicArn, "email", "ramachandrans410@gmail.com")
+    
+    sns_client = boto3.client('sns', verify=False)
+    # Publish to topic
+    sns_client.publish(TopicArn=topicArn,
+            Message="message text",
+            Subject="subject used in emails only")
